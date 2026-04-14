@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+life_coach_memory.db
+streamlit.log
