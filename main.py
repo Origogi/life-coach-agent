@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -18,15 +17,8 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "life_coach_memory.db"
 SESSION_ID = "life-coach-chat"
 DEFAULT_MODEL = "gpt-5-mini"
-VECTOR_STORE_NAME = "life-coach-personal-records"
 VECTOR_STORE_ID_ENV = "OPENAI_VECTOR_STORE_ID"
 SUPPORTED_UPLOAD_TYPES = ["pdf", "txt"]
-DOCUMENT_TYPES = {
-    "Goal": "goal",
-    "Journal": "journal",
-    "Routine": "routine",
-    "Other": "other",
-}
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_VECTOR_STORE_ID = os.getenv(VECTOR_STORE_ID_ENV)
 
@@ -38,8 +30,11 @@ If the user's request is clearly outside those topics, politely refuse to answer
 You may have access to the user's uploaded personal files such as goal documents, journals, routines, and progress notes.
 When the user asks about their goals, habits, routines, diary entries, plans, or progress over time, search their uploaded files first.
 If uploaded files contain dates or multiple records, compare them to identify progress, regressions, and consistency over time.
+Use web search aggressively whenever the user asks for advice, techniques, best practices, examples, evidence-backed methods, recent trends, or anything that may benefit from outside knowledge.
+If you are not highly confident that your built-in knowledge is enough, do a web search before answering.
 After checking the user's files, use web search when you need outside evidence, current information, or research-backed advice.
 For most non-trivial coaching questions, use either file search, web search, or both before answering.
+When both personal context and outside guidance matter, use file search first and then web search in the same turn.
 When you actually use file search, briefly mention it in your answer with a line formatted like: [개인 기록 검색]
 When you actually use web search, briefly mention it in your answer with a line formatted like: [웹 검색: "search query"]
 Do not mention a tool if you did not use it.
@@ -74,14 +69,11 @@ def get_saved_vector_store_id() -> str | None:
     return vector_store_id
 
 
-def get_or_create_vector_store_id() -> str:
+def get_required_vector_store_id() -> str:
     vector_store_id = get_saved_vector_store_id()
     if vector_store_id:
         return vector_store_id
-
-    vector_store = get_openai_client().vector_stores.create(name=VECTOR_STORE_NAME)
-    st.session_state["vector_store_id"] = vector_store.id
-    return vector_store.id
+    raise RuntimeError(f"{VECTOR_STORE_ID_ENV} is not set.")
 
 
 def get_uploaded_documents() -> list[dict[str, str]]:
@@ -110,7 +102,7 @@ def wait_until_vector_store_file_ready(
     *,
     client: OpenAI,
     vector_store_id: str,
-    vector_store_file_id: str,
+    file_id: str,
     timeout_seconds: int = 60,
     poll_interval_seconds: float = 1.0,
 ) -> None:
@@ -119,7 +111,7 @@ def wait_until_vector_store_file_ready(
     while True:
         vector_store_file = client.vector_stores.files.retrieve(
             vector_store_id=vector_store_id,
-            file_id=vector_store_file_id,
+            file_id=file_id,
         )
         status = getattr(vector_store_file, "status", "")
         if status == "completed":
@@ -149,7 +141,7 @@ def upload_personal_file(
     entry_date: str,
 ) -> str:
     client = get_openai_client()
-    vector_store_id = get_or_create_vector_store_id()
+    vector_store_id = get_required_vector_store_id()
     uploaded = client.files.create(
         file=build_upload_payload(uploaded_file),
         purpose="user_data",
@@ -166,7 +158,7 @@ def upload_personal_file(
     wait_until_vector_store_file_ready(
         client=client,
         vector_store_id=vector_store_id,
-        vector_store_file_id=vector_store_file.id,
+        file_id=uploaded.id,
     )
     remember_uploaded_document(
         filename=uploaded_file.name,
@@ -175,6 +167,31 @@ def upload_personal_file(
         entry_date=entry_date,
     )
     return uploaded.id
+
+
+def reset_bucket() -> int:
+    client = get_openai_client()
+    vector_store_id = get_required_vector_store_id()
+    deleted_count = 0
+
+    for vector_store_file in client.vector_stores.files.list(
+        vector_store_id=vector_store_id,
+        limit=100,
+        order="desc",
+    ):
+        file_id = getattr(vector_store_file, "id", None)
+        if not isinstance(file_id, str) or not file_id:
+            continue
+
+        client.vector_stores.files.delete(
+            vector_store_id=vector_store_id,
+            file_id=file_id,
+        )
+        client.files.delete(file_id)
+        deleted_count += 1
+
+    get_uploaded_documents().clear()
+    return deleted_count
 
 
 def get_chat_session() -> SQLiteSession:
@@ -190,6 +207,18 @@ def format_tool_event(tool: str, content: str) -> dict[str, str]:
         "tool": tool,
         "content": content,
     }
+
+
+def format_assistant_message(content: str) -> dict[str, str]:
+    return {
+        "role": "assistant",
+        "kind": "message",
+        "content": content,
+    }
+
+
+def add_display_message(content: str) -> None:
+    st.session_state["messages"].append(format_assistant_message(content))
 
 
 def session_items_to_messages(items: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -322,21 +351,12 @@ if "model" not in st.session_state:
 if "pending_message" not in st.session_state:
     st.session_state["pending_message"] = None
 
-if "upload_notice" not in st.session_state:
-    st.session_state["upload_notice"] = None
-
-if "uploaded_documents" not in st.session_state:
-    st.session_state["uploaded_documents"] = []
-
-
 st.title("Life Coach Agent")
-
-if st.session_state["upload_notice"]:
-    st.success(st.session_state["upload_notice"])
-    st.session_state["upload_notice"] = None
 
 if not OPENAI_API_KEY:
     st.warning("`OPENAI_API_KEY`가 설정되지 않았습니다. 파일 업로드와 채팅 응답은 동작하지 않습니다.")
+elif not get_saved_vector_store_id():
+    st.warning(f"`{VECTOR_STORE_ID_ENV}`가 설정되지 않았습니다. 파일 업로드와 파일 검색은 동작하지 않습니다.")
 
 
 for message in st.session_state["messages"]:
@@ -347,45 +367,24 @@ for message in st.session_state["messages"]:
             st.write(escape_markdown_text(message["content"]))
 
 
-selected_document_type_label = "Goal"
-selected_entry_date = date.today()
-
 with st.sidebar:
     st.write(f"Current model: `{st.session_state['model']}`")
-    vector_store_id = get_saved_vector_store_id()
-    if vector_store_id:
-        st.caption(f"Vector store: `{vector_store_id}`")
-    else:
-        st.caption("Vector store will be created automatically on the first file upload.")
-        st.caption(f"Optional env: `{VECTOR_STORE_ID_ENV}`")
-
-    selected_document_type_label = st.selectbox(
-        "Next upload type",
-        options=list(DOCUMENT_TYPES.keys()),
-        index=0,
-    )
-    selected_entry_date = st.date_input(
-        "Record date",
-        value=date.today(),
-    )
-
     reset = st.button("Reset memory")
     if reset:
         clear_messages()
         st.session_state["messages"] = []
         st.rerun()
 
-    st.divider()
-    st.write("Uploaded personal files")
-    uploaded_documents = get_uploaded_documents()
-    if uploaded_documents:
-        for document in uploaded_documents[:10]:
-            label = f"{document['filename']} · {document['document_type']}"
-            if document["entry_date"]:
-                label += f" · {document['entry_date']}"
-            st.caption(label)
-    else:
-        st.caption("No files uploaded yet.")
+    reset_bucket_clicked = st.button("Reset bucket")
+    if reset_bucket_clicked:
+        try:
+            deleted_count = reset_bucket()
+            add_display_message(f"Bucket reset 완료. {deleted_count}개 파일을 삭제했습니다.")
+            st.rerun()
+        except Exception as error:
+            st.error(f"Bucket reset error: {error}")
+
+    st.write(run_async(get_chat_session().get_items()))
 
 
 async def run_agent(message: str) -> None:
@@ -488,9 +487,6 @@ if prompt:
 
     uploaded_filenames: list[str] = []
     upload_failed = False
-    selected_document_type = DOCUMENT_TYPES[selected_document_type_label]
-    entry_date = selected_entry_date.isoformat()
-
     if prompt_files:
         with st.chat_message("assistant"):
             with st.status("⏳ 파일 업로드 중...", expanded=True) as status:
@@ -501,8 +497,8 @@ if prompt:
                         )
                         upload_personal_file(
                             uploaded_file,
-                            document_type=selected_document_type,
-                            entry_date=entry_date,
+                            document_type="other",
+                            entry_date="",
                         )
                         uploaded_filenames.append(uploaded_file.name)
                     status.update(label="✅ 파일 업로드 완료", state="complete")
@@ -512,10 +508,13 @@ if prompt:
                     st.error(f"File upload error: {error}")
 
     if uploaded_filenames:
-        st.session_state["upload_notice"] = (
-            f"{len(uploaded_filenames)}개 파일을 업로드했습니다: "
-            + ", ".join(uploaded_filenames)
-        )
+        if len(uploaded_filenames) == 1:
+            add_display_message(f"`{uploaded_filenames[0]}` 파일 업로드가 완료되었습니다.")
+        else:
+            add_display_message(
+                f"{len(uploaded_filenames)}개 파일 업로드가 완료되었습니다: "
+                + ", ".join(f"`{name}`" for name in uploaded_filenames)
+            )
 
     if prompt_text and not upload_failed:
         st.session_state["messages"].append(
