@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import time
 from pathlib import Path
@@ -8,7 +9,7 @@ from typing import Any
 
 import dotenv
 import streamlit as st
-from agents import Agent, FileSearchTool, Runner, SQLiteSession, WebSearchTool
+from agents import Agent, FileSearchTool, ImageGenerationTool, Runner, SQLiteSession, WebSearchTool
 from openai import OpenAI
 
 dotenv.load_dotenv()
@@ -25,8 +26,10 @@ DEFAULT_VECTOR_STORE_ID = os.getenv(VECTOR_STORE_ID_ENV)
 COACH_PERSONA = """
 You are a warm, practical life coach.
 Your job is to encourage the user, give specific and actionable advice, and help them build better habits step by step.
-Your allowed topics are motivation, self-improvement, habit-building, productivity, mindset, focus, routines, goal setting, and personal growth.
+Your allowed topics are motivation, self-improvement, habit-building, productivity, mindset, focus, routines, goal setting, personal growth, and life-coaching-related image generation.
 If the user's request is clearly outside those topics, politely refuse to answer and briefly redirect them back to life-coaching topics you can help with.
+You can generate images when the user asks for visuals related to their coaching journey — such as a vision board concept, goal visualization, motivational illustration, or a habit tracker design.
+Only generate images that serve a clear life-coaching purpose; decline image requests unrelated to personal growth.
 You may have access to the user's uploaded personal files such as goal documents, journals, routines, and progress notes.
 When the user asks about their goals, habits, routines, diary entries, plans, or progress over time, search their uploaded files first.
 If uploaded files contain dates or multiple records, compare them to identify progress, regressions, and consistency over time.
@@ -194,9 +197,24 @@ def reset_bucket() -> int:
     return deleted_count
 
 
-def get_chat_session() -> SQLiteSession:
+def _strip_url_citations(item: dict[str, Any]) -> dict[str, Any]:
+    content = item.get("content")
+    if isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict) and "annotations" in c:
+                c["annotations"] = [a for a in c["annotations"] if a.get("type") != "url_citation"]
+    return item
+
+
+class PatchedSQLiteSession(SQLiteSession):
+    async def get_items(self, limit: int | None = None) -> list[Any]:
+        items = await super().get_items(limit)
+        return [_strip_url_citations(item) for item in items]
+
+
+def get_chat_session() -> PatchedSQLiteSession:
     if "session" not in st.session_state:
-        st.session_state["session"] = SQLiteSession(SESSION_ID, str(DB_PATH))
+        st.session_state["session"] = PatchedSQLiteSession(SESSION_ID, str(DB_PATH))
     return st.session_state["session"]
 
 
@@ -255,6 +273,12 @@ def session_items_to_messages(items: list[dict[str, Any]]) -> list[dict[str, str
                 messages.append(format_tool_event("file_search", "uploaded files"))
             continue
 
+        if item_type == "image_generation_call":
+            result = item.get("result")
+            if result:
+                messages.append(format_tool_event("image_generation", result))
+            continue
+
         if role == "assistant" and item_type == "message":
             text_parts: list[str] = []
             if isinstance(content, list):
@@ -307,7 +331,15 @@ def clear_messages() -> None:
 
 
 def get_agent(model: str) -> Agent:
-    tools: list[Any] = [WebSearchTool()]
+    tools: list[Any] = [
+        WebSearchTool(),
+        ImageGenerationTool(tool_config={
+            "type": "image_generation",
+            "quality": "high",
+            "output_format": "jpeg",
+            "partial_images": 1,
+        }),
+    ]
     vector_store_id = get_saved_vector_store_id()
     if vector_store_id:
         tools.append(
@@ -337,6 +369,14 @@ def render_tool_message(message: dict[str, str]) -> None:
         st.write("🗂️ **Life Coach** used tool: `file_search`")
         if message.get("content"):
             st.caption(f'query: "{message["content"]}"')
+        return
+
+    if tool == "image_generation":
+        st.write("🎨 **Life Coach** used tool: `image_generation`")
+        content = message.get("content")
+        if content:
+            image_bytes = base64.b64decode(content)
+            st.image(image_bytes)
         return
 
     st.write(escape_markdown_text(message.get("content", "")))
@@ -392,9 +432,11 @@ async def run_agent(message: str) -> None:
         status_placeholder = st.empty()
         tool_placeholder = st.empty()
         text_placeholder = st.empty()
+        image_placeholder = st.empty()
         response = ""
         used_web_search = False
         used_file_search = False
+        used_image_generation = False
         status_placeholder.write("생각 중...")
 
         try:
@@ -425,6 +467,17 @@ async def run_agent(message: str) -> None:
                 }:
                     used_web_search = True
                     status_placeholder.write("웹 검색 중...")
+                elif event_type in {
+                    "response.image_generation_call.in_progress",
+                    "response.image_generation_call.generating",
+                }:
+                    used_image_generation = True
+                    status_placeholder.write("🎨 이미지 생성 중...")
+                elif event_type == "response.image_generation_call.partial_image":
+                    image_placeholder.image(base64.b64decode(event.data.partial_image_b64))
+                elif event_type == "response.completed":
+                    image_placeholder.empty()
+                    text_placeholder.empty()
 
             latest_tool_events = await load_latest_tool_events_async()
             if latest_tool_events:
@@ -453,7 +506,7 @@ async def run_agent(message: str) -> None:
                     )
 
             assistant_reply = response.strip()
-            if not assistant_reply:
+            if not assistant_reply and not used_image_generation:
                 text_placeholder.write("응답을 생성하지 못했습니다. 다시 시도해 주세요.")
 
             status_placeholder.empty()
